@@ -6,14 +6,14 @@
 
 
 -module(cowboy_revproxy).
--behaviour(cowboy_protocol).
+%% -behaviour(cowboy_protocol).
 
 
 -export([start_link/4]).
 -export([init/4]).
 
 -include_lib("eunit/include/eunit.hrl").
--include_lib("cowboy/include/http.hrl").
+%% -include_lib("cowboy/include/http.hrl").
 
 %% proxy state
 -record(stproxy, {
@@ -28,26 +28,24 @@
         remote_transport :: module()
     }).
 
+%% HTTP protocol state
 -record(state, {
-    listener :: pid(),
-    socket :: inet:socket(),
-    transport :: module(),
-    dispatch :: cowboy_dispatcher:dispatch_rules(),
-    handler :: {module(), any()},
-    onrequest :: undefined | fun((#http_req{}) -> #http_req{}),
-    onresponse = undefined :: undefined | fun((cowboy_http:status(),
-        cowboy_http:headers(), #http_req{}) -> #http_req{}),
-    urldecode :: {fun((binary(), T) -> binary()), T},
-    req_empty_lines = 0 :: integer(),
-    max_empty_lines :: integer(),
-    req_keepalive = 1 :: integer(),
-    max_keepalive :: integer(),
-    max_line_length :: integer(),
-    timeout :: timeout(),
-    buffer = <<>> :: binary(),
-    hibernate = false :: boolean(),
-    loop_timeout = infinity :: timeout(),
-    loop_timeout_ref :: undefined | reference()
+	socket :: inet:socket(),
+	transport :: module(),
+	middlewares :: [module()],
+	compress :: boolean(),
+	env :: cowboy_middleware:env(),
+	onrequest :: undefined | cowboy:onrequest_fun(),
+	onresponse = undefined :: undefined | cowboy:onresponse_fun(),
+	max_empty_lines :: non_neg_integer(),
+	req_keepalive = 1 :: non_neg_integer(),
+	max_keepalive :: non_neg_integer(),
+	max_request_line_length :: non_neg_integer(),
+	max_header_name_length :: non_neg_integer(),
+	max_header_value_length :: non_neg_integer(),
+	max_headers :: non_neg_integer(),
+	timeout :: timeout(),
+	until :: non_neg_integer() | infinity
 }).
 
 %% @doc Start a revproxy process
@@ -61,13 +59,13 @@ start_link(ListenerPid, Socket, Transport, Opts) ->
 init(ListenerPid, Socket, Transport, Opts) ->
     Handler = proplists:get_value(proxy, Opts),
     Timeout = proplists:get_value(timeout, Opts, 5000),
-    ok = cowboy:accept_ack(ListenerPid),
+    ok = ranch:accept_ack(ListenerPid),
     wait_request(#stproxy{listener=ListenerPid, socket=Socket,
             transport=Transport, handler=Handler, timeout=Timeout}).
 
 -spec wait_request(#stproxy{}) -> ok | none().
 wait_request(State=#stproxy{socket=Socket, transport=Transport, timeout=T,
-        handler=Handler, buffer=Buffer}) ->
+                            handler=Handler, buffer=Buffer}) ->
 
     case Transport:recv(Socket, 0, T) of
         {ok, Data} ->
@@ -76,22 +74,23 @@ wait_request(State=#stproxy{socket=Socket, transport=Transport, timeout=T,
                 stop ->
                     terminate(State);
                 {stop, Reply} ->
-                Transport:send(Socket, Reply),
+                    Transport:send(Socket, Reply),
                     terminate(State);
                 {http, Dispatch} ->
-                    #stproxy{listener=Listener, timeout=T} = State,
-                    URLDec = {fun cowboy_http:urldecode/2, crash},
-                    cowboy_http_protocol:parse_request(#state{listener=Listener,
-                            socket=Socket, transport=Transport,
-                            dispatch=Dispatch, buffer = Buffer1,
-                            urldecode=URLDec, timeout=T});
+                    #stproxy{listener=Listener} = State,
+                    cowboy_protocol:parse_request(Buffer1, #state{socket=Socket, transport=Transport,
+                                                                  middlewares = [cowboy_router, cowboy_handler],
+                                                                  timeout = 10000,
+                                                                  env= [{dispatch, Dispatch}, {listener, Listener}],
+                                                                  max_request_line_length=10240,
+                                                                  max_empty_lines=2},0);
                 {remote, Remote} ->
                     start_proxy_loop(State#stproxy{buffer=Buffer1, remote=Remote});
-                [{remote, Remote}, {data, NewData}] ->
-                    start_proxy_loop(State#stproxy{buffer=NewData, remote=Remote});
-                [{remote, Remote}, {data, NewData}, {reply, Reply}] ->
+                [{remote, Remote}, {data, Data}] ->
+                    start_proxy_loop(State#stproxy{buffer=Data, remote=Remote});
+                [{remote, Remote}, {data, Data}, {reply, Reply}] ->
                     Transport:send(Socket, Reply),
-                    start_proxy_loop(State#stproxy{buffer=NewData, remote=Remote});
+                    start_proxy_loop(State#stproxy{buffer=Data, remote=Remote});
                 _ ->
                     wait_request(State#stproxy{buffer=Buffer1})
             end;
